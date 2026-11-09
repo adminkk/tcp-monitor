@@ -9,7 +9,7 @@
     *{box-sizing:border-box}body{margin:0}main{max-width:1280px;margin:auto;padding:36px 24px}
     header{display:flex;justify-content:space-between;gap:20px;align-items:center;flex-wrap:wrap}h1{font-size:28px;margin:8px 0}p{color:#93a8c7;font-size:14px;line-height:1.7}
     .eyebrow{color:#60d9c0;font-size:12px;letter-spacing:2px}.badge{background:#173c37;color:#79e3cd;border-radius:20px;padding:8px 14px;font-size:13px}
-    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:26px 0}.card,.panel{background:#111e31;border:1px solid #26364f;border-radius:14px;padding:20px}.label{color:#9eb0cb;font-size:13px}.value{font-size:32px;font-weight:650;margin-top:8px;font-variant-numeric:tabular-nums}
+    .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin:26px 0}.card,.panel{background:#111e31;border:1px solid #26364f;border-radius:14px;padding:20px}.label{color:#9eb0cb;font-size:13px}.value{font-size:32px;font-weight:650;margin-top:8px;font-variant-numeric:tabular-nums}
     .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:18px}button,select,.file,input[type=datetime-local]{font:inherit;background:#1b2c44;color:#deebff;border:1px solid #364b68;border-radius:8px;padding:9px 12px;font-size:13px;cursor:pointer}button:hover,.file:hover{border-color:#60d9c0}input[type=file]{display:none}input[type=checkbox]{accent-color:#60d9c0}.grow{flex:1}.small{font-size:13px;color:#93a8c7}.chart{position:relative;height:350px}canvas{width:100%;height:100%;display:block}.tooltip{display:none;position:absolute;pointer-events:none;background:#07101f;border:1px solid #54708c;padding:9px;border-radius:7px;font-size:12px;white-space:pre-line}
     #message{min-height:24px;color:#a3b8d5;font-size:13px;line-height:1.6;margin:16px 0}.table-wrap{overflow:auto;max-height:340px}table{width:100%;border-collapse:collapse;font-size:13px;text-align:left}th,td{padding:12px;border-bottom:1px solid #26364f}th{color:#9eb0cb;position:sticky;top:0;background:#111e31}.section-title{font-size:16px;margin:0 0 14px}footer{margin-top:20px;color:#8499b6;font-size:12px;line-height:1.8}
     @media(max-width:650px){main{padding:20px 12px}.stats{grid-template-columns:repeat(2,1fr);gap:10px}.card,.panel{padding:14px}.chart{height:290px}.value{font-size:27px}}
@@ -20,7 +20,8 @@
   <header><div><div class="eyebrow">NETWORK / TCP</div><h1>TCP 连接趋势</h1><p>每分钟连接快照 · 按保留天数滚动清理</p></div><span class="badge" id="badge">等待数据</span></header>
   <div class="stats">
     <div class="card"><div class="label">区间末次连接数</div><div class="value" id="current">—</div></div>
-    <div class="card"><div class="label">区间峰值</div><div class="value" id="peak">—</div></div>
+    <div class="card"><div class="label">区间最大值</div><div class="value" id="peak">—</div></div>
+    <div class="card"><div class="label">区间最小值</div><div class="value" id="minimum">—</div></div>
     <div class="card"><div class="label">区间均值</div><div class="value" id="average">—</div></div>
     <div class="card"><div class="label">区间缺测 / 总样本</div><div class="value" id="samples">—</div></div>
   </div>
@@ -158,7 +159,7 @@ function render() {
   }
   const changes = visible.filter(r => r.breakBefore).length;
   $('scope-change').textContent = selected === 'all' && changes ?
-    `当前区间监控端口发生 ${changes} 次变化，合计曲线已在变化处断开。峰值和均值跨不同端口范围计算，仅供参考；明细和悬浮提示可查看每次监控端口。` :
+    `当前区间监控端口发生 ${changes} 次变化，合计曲线已在变化处断开。最大值、最小值和均值跨不同端口范围计算，仅供参考；明细和悬浮提示可查看每次监控端口。` :
     selected !== 'all' && visible.some(r => r.error === '该样本未监控所选端口') ?
       '当前区间部分时间未监控所选端口，显示为缺测，未计入均值。' : '';
   if (mode !== 'custom') {
@@ -169,6 +170,7 @@ function render() {
   const last = records[records.length - 1];
   $('current').textContent = number(visible[visible.length - 1]?.count);
   $('peak').textContent = valid.length ? number(valid.reduce((n, r) => Math.max(n, r.count), 0)) : '—';
+  $('minimum').textContent = valid.length ? number(valid.reduce((n, r) => Math.min(n, r.count), Infinity)) : '—';
   $('average').textContent = valid.length ? (valid.reduce((n, r) => n + r.count, 0) / valid.length).toFixed(1) : '—';
   $('samples').textContent = `${visible.length - valid.length} / ${visible.length}`;
   $('badge').textContent = readError ? '读取失败' : !last ? '等待数据' : source === 'file' ? '离线数据' : Date.now() / 1000 - last.timestamp > 150 ? '采集已超时' : last.count === null ? '采集失败' : '正在采集';
