@@ -39,7 +39,7 @@
     <div id="legacy" class="small" role="status"></div>
     <div id="scope-change" class="small" role="status"></div>
   </section>
-  <section class="panel" style="margin-top:20px"><h2 class="section-title">最近 60 条记录</h2><div class="table-wrap"><table><thead><tr><th>采集时间</th><th>连接数</th><th>结果</th><th>该次监控端口</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+  <section class="panel" style="margin-top:20px"><h2 class="section-title">所选范围内最近 60 条记录</h2><div class="table-wrap"><table><thead><tr><th>采集时间</th><th>连接数</th><th>结果</th><th>统计端口</th></tr></thead><tbody id="rows"></tbody></table></div></section>
   <footer>ESTABLISHED 表示已建立连接；ALL 包含监听及其他 TCP 状态。按本机端口筛选，IPv4 / IPv6 一并统计。<br>缺测及超过 90 秒的采集间隔会断开曲线。时间按浏览器本地时区显示；鼠标移到曲线上可查看采样值。</footer>
 </main>
 <script>
@@ -47,6 +47,7 @@
 const $ = id => document.getElementById(id);
 let records = [], visible = [], source = 'server', importedFile = null, requestVersion = 0;
 let chartPoints = [], domain = null, customBounds = null, rangeBounds = null;
+let readError = false;
 const fmt = t => new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
 const number = n => n == null ? '—' : n.toLocaleString('zh-CN');
 
@@ -77,13 +78,13 @@ function parseData(text) {
   return { records: result.sort((a, b) => a.timestamp - b.timestamp), invalid };
 }
 
-async function load() {
+async function load(nextSource = source, nextFile = importedFile, enableAuto = false) {
   const version = ++requestVersion;
   try {
     let text;
-    if (source === 'file') {
-      if (!importedFile) return;
-      text = await importedFile.text();
+    if (nextSource === 'file') {
+      if (!nextFile) return false;
+      text = await nextFile.text();
     } else {
       if (location.protocol === 'file:') throw new Error('本地打开页面时，请点击“导入文本”选择下载的 tcp_connections.txt。');
       const response = await fetch('./tcp_connections.txt', { cache: 'no-store', signal: AbortSignal.timeout(15000) });
@@ -92,16 +93,23 @@ async function load() {
     }
     if (version !== requestVersion) return;
     const parsed = parseData(text);
+    source = nextSource; importedFile = nextFile; readError = false;
+    $('auto').disabled = source === 'file';
+    if (source === 'file') $('auto').checked = false;
+    else if (enableAuto) $('auto').checked = true;
     records = parsed.records;
     updatePorts();
     render();
-    $('message').textContent = (source === 'file' ? '离线文件：更新后请重新导入。' : '每分钟自动读取服务器文本。') +
+    $('message').textContent = (source === 'file' ? '离线文件：更新后请重新导入。' : '服务器文本：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。')) +
       (parsed.invalid ? ` 已跳过 ${parsed.invalid} 行无效数据。` : '') +
       (records.length ? ' 最新采样：' + fmt(records[records.length - 1].timestamp) : ' 暂无采样数据。');
+    return true;
   } catch (error) {
     if (version !== requestVersion) return;
+    readError = true;
     $('badge').textContent = '读取失败';
     $('message').textContent = error.message + '；图中保留上次成功读取的数据。';
+    return false;
   }
 }
 
@@ -131,6 +139,12 @@ function scopeLabel(row) {
   return row.ports.length ? row.ports.join(', ') : '整机全部';
 }
 
+function statisticScope(row) {
+  const selected = $('port').value;
+  if (selected === 'all') return scopeLabel(row);
+  return selected + (row.ports.includes(Number(selected)) ? '' : '（该次未监控）');
+}
+
 function render() {
   const mode = $('range').value;
   const end = source === 'file' && records.length ? records[records.length - 1].timestamp : Date.now() / 1000;
@@ -157,22 +171,27 @@ function render() {
   $('peak').textContent = valid.length ? number(valid.reduce((n, r) => Math.max(n, r.count), 0)) : '—';
   $('average').textContent = valid.length ? (valid.reduce((n, r) => n + r.count, 0) / valid.length).toFixed(1) : '—';
   $('samples').textContent = `${visible.length - valid.length} / ${visible.length}`;
-  $('badge').textContent = !last ? '等待数据' : source === 'file' ? '离线数据' : Date.now() / 1000 - last.timestamp > 150 ? '采集已超时' : last.count === null ? '采集失败' : '正在采集';
-  $('scope').textContent = last ? `来源：${source === 'file' ? importedFile.name : '服务器文本'} · 状态：${last.state.toUpperCase()} · 当前查看：${selected === 'all' ? '全部端口合计' : '本机端口 ' + selected} · 监控端口：${last.ports.length ? last.ports.join(', ') : '整机全部'}` : '来源：tcp_connections.txt';
+  $('badge').textContent = readError ? '读取失败' : !last ? '等待数据' : source === 'file' ? '离线数据' : Date.now() / 1000 - last.timestamp > 150 ? '采集已超时' : last.count === null ? '采集失败' : '正在采集';
+  $('scope').textContent = last ? `来源：${source === 'file' ? importedFile.name : '服务器文本'} · 状态：${last.state.toUpperCase()} · 当前统计：${selected === 'all' ? '全部端口合计' : '本机端口 ' + selected} · 最新采集范围：${scopeLabel(last)}` : '来源：tcp_connections.txt';
   $('legacy').textContent = selected !== 'all' && visible.some(r => r.error === '旧版合计记录没有端口明细') ?
     '当前区间包含旧版多端口合计记录，无法拆分的历史点显示为缺测；升级后新采集的数据可按端口查看。' : '';
   $('rows').replaceChildren();
   for (const r of visible.slice(-60).reverse()) {
     const tr = document.createElement('tr');
-    for (const value of [fmt(r.timestamp), number(r.count), r.count === null ? '缺测：' + (r.error || '采集失败') : '成功', scopeLabel(r)]) {
+    for (const value of [fmt(r.timestamp), number(r.count), r.count === null ? '缺测：' + (r.error || '采集失败') : '成功', statisticScope(r)]) {
       const td = document.createElement('td'); td.textContent = value; tr.append(td);
     }
     $('rows').append(tr);
+  }
+  if (!visible.length) {
+    const tr = document.createElement('tr'), td = document.createElement('td');
+    td.colSpan = 4; td.textContent = '当前范围暂无记录'; tr.append(td); $('rows').append(tr);
   }
   draw();
 }
 
 function draw() {
+  $('tooltip').style.display = 'none';
   const canvas = $('chart'), width = canvas.clientWidth, height = canvas.clientHeight;
   const ratio = window.devicePixelRatio || 1;
   canvas.width = width * ratio; canvas.height = height * ratio;
@@ -238,9 +257,11 @@ $('chart').addEventListener('mousemove', event => {
   let lo = 0, hi = visible.length - 1;
   while (lo < hi) { const mid = Math.floor((lo + hi) / 2); if (visible[mid].timestamp < time) lo = mid + 1; else hi = mid; }
   let r = visible[lo]; if (lo && Math.abs(visible[lo - 1].timestamp - time) < Math.abs(r.timestamp - time)) r = visible[lo - 1];
-  const tip = $('tooltip'); tip.textContent = fmt(r.timestamp) + '\n连接数：' + (r.count === null ? '缺测' : number(r.count)) +
-    '\n该次监控端口：' + scopeLabel(r) + (r.breakBefore ? '\n监控端口范围变化，曲线从此处断开' : '');
-  tip.style.display = 'block'; tip.style.left = Math.max(0, Math.min(xx + 12, rect.width - 190)) + 'px'; tip.style.top = '8px';
+  const tip = $('tooltip'); tip.textContent = fmt(r.timestamp) + '\n连接数：' + (r.count === null ? '缺测（' + (r.error || '采集失败') + '）' : number(r.count)) +
+    '\n统计端口：' + statisticScope(r) + ($('port').value !== 'all' ? '\n该次采集范围：' + scopeLabel(r) : '') +
+    (r.breakBefore ? '\n监控端口范围变化，曲线从此处断开' : '');
+  tip.style.maxWidth = rect.width + 'px'; tip.style.overflowWrap = 'anywhere';
+  tip.style.display = 'block'; tip.style.left = Math.max(0, Math.min(xx + 12, rect.width - tip.offsetWidth)) + 'px'; tip.style.top = '8px';
 });
 $('chart').addEventListener('mouseleave', () => { $('tooltip').style.display = 'none'; });
 function localInput(timestamp) {
@@ -258,11 +279,15 @@ $('apply').addEventListener('click', () => {
   customBounds = [start, end]; $('range').value = 'custom'; render();
   $('message').textContent = `查看区间：${fmt(start)} — ${fmt(end)}。仅展示文本中仍保留的数据。`;
 });
-$('refresh').addEventListener('click', load);
-$('online').addEventListener('click', () => { source = 'server'; $('auto').disabled = false; $('auto').checked = true; load(); });
+$('refresh').addEventListener('click', () => load());
+$('online').addEventListener('click', () => load('server', importedFile, true));
+$('auto').addEventListener('change', () => {
+  if (!readError && source === 'server') $('message').textContent = $('message').textContent.replace(
+    /^服务器文本：[^。]*。/, '服务器文本：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。'));
+});
 $('file').addEventListener('change', event => {
   const file = event.target.files[0]; if (!file) return;
-  source = 'file'; importedFile = file; $('auto').checked = false; $('auto').disabled = true; load();
+  load('file', file);
   event.target.value = '';
 });
 new ResizeObserver(draw).observe($('chart'));
