@@ -143,6 +143,7 @@ test('failed source changes preserve data and source, and read error survives fi
   assert.equal(run('source'), 'file');
   assert.equal(get('auto').disabled, true);
   assert.equal(get('auto').checked, false);
+  assert.equal(get('online').hidden, false);
   get('port').value = '10001'; run('render()');
   assert.equal(get('badge').textContent, '读取失败');
   assert.match(get('scope').textContent, /history.txt/);
@@ -151,6 +152,7 @@ test('failed source changes preserve data and source, and read error survives fi
   assert.equal(await run("load('server', importedFile, true)"), true);
   assert.equal(get('auto').checked, true);
   assert.equal(get('auto').disabled, false);
+  assert.equal(get('online').hidden, true);
   assert.equal(get('port').value, '10001');
   get('auto').checked = false; get('auto').listeners.change();
   assert.match(get('message').textContent, /自动刷新已暂停/);
@@ -216,4 +218,63 @@ test('a late range response cannot overwrite a newer range; invalid responses ke
   assert.equal(await run('load()'), false);
   assert.equal(run('records.length'), 2);
   assert.equal(get('badge').textContent, '读取失败');
+});
+
+test('SQLite imports upload a binary snapshot, show its history, and can return to the server', async () => {
+  const {get, run} = await dashboard();
+  assert.equal(get('online').hidden, true);
+  run(`let requests=[]; let databaseFile={name:'snapshot.sqlite3',size:4096};
+    fetch=async (url, options) => {requests.push({url,options}); return {ok:true,
+    text:async () => JSON.stringify(url === './api/import' ? {records:${JSON.stringify(rows)}} :
+      {records:[],latest:null,ports:[]})}; };`);
+  assert.equal(await run("load('file', databaseFile)"), true);
+  assert.equal(run('requests[0].url'), './api/import');
+  assert.equal(run('requests[0].options.method'), 'POST');
+  assert.equal(run("requests[0].options.headers['Content-Type']"), 'application/vnd.sqlite3');
+  assert.equal(run('requests[0].options.body === databaseFile'), true);
+  assert.equal(run('source'), 'file');
+  assert.equal(get('auto').disabled, true);
+  assert.equal(get('auto').checked, false);
+  assert.equal(get('online').hidden, false);
+  assert.equal(get('samples').textContent, '0 / 2');
+  assert.match(get('scope').textContent, /snapshot.sqlite3/);
+  assert.match(get('message').textContent, /不覆盖服务器数据/);
+  await get('online').listeners.click();
+  assert.equal(run('source'), 'server');
+  assert.equal(get('auto').disabled, false);
+  assert.equal(get('auto').checked, true);
+  assert.equal(get('online').hidden, true);
+});
+
+test('invalid SQLite imports preserve existing data and explain file and size restrictions', async () => {
+  const {get, run} = await offlineBrush();
+  run("fetch=async () => ({ok:false,status:400,text:async () => JSON.stringify({error:'数据库格式不兼容'})})");
+  assert.equal(await run("load('file', {name:'bad.db',size:40})"), false);
+  assert.equal(run('records.length'), 61);
+  assert.equal(run('importedFile.name'), 'brush.txt');
+  assert.match(get('message').textContent, /数据库格式不兼容/);
+  run("fetch=async () => ({ok:true,text:async () => JSON.stringify({records:[{}]})})");
+  assert.equal(await run("load('file', {name:'invalid.sqlite',size:4096})"), false);
+  assert.match(get('message').textContent, /无效的采样记录/);
+  assert.equal(await run("load('file', {name:'huge.sqlite3',size:257*1024*1024})"), false);
+  assert.match(get('message').textContent, /256 MB/);
+  run("location.protocol='file:'");
+  assert.equal(await run("load('file', {name:'snapshot.sqlite3',size:4096})"), false);
+  assert.match(get('message').textContent, /通过监控服务网页/);
+  assert.equal(run('records.length'), 61);
+  // Legacy text still works when index.html is opened directly from disk.
+  assert.equal(await run('load()'), true);
+  assert.equal(run('records.length'), 61);
+  assert.equal(get('online').hidden, true);
+});
+
+test('a delayed SQLite upload cannot replace a newer import', async () => {
+  const {run} = await dashboard();
+  run('let finishUpload; fetch=() => new Promise(resolve => {finishUpload=resolve});');
+  const pending = run("load('file',{name:'old.sqlite3',size:4096})");
+  await run(`load('file',{name:'new.txt',text:async () => ${JSON.stringify(JSON.stringify(rows[0]))}})`);
+  run(`finishUpload({ok:true,text:async () => JSON.stringify({records:${JSON.stringify(rows)}})})`);
+  await pending;
+  assert.equal(run('importedFile.name'), 'new.txt');
+  assert.equal(run('records.length'), 1);
 });

@@ -1,5 +1,6 @@
 """Isolated tests: no real TCP scan, no production services."""
 import json
+from contextlib import closing
 from pathlib import Path
 import subprocess
 import sqlite3
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from tcp_monitor import DB_NAME, DATA_NAME, History, make_server, sample
+from tcp_monitor import DB_NAME, DATA_NAME, MAX_IMPORT_BYTES, History, make_server, read_database_snapshot, sample
 
 
 class MonitorTest(unittest.TestCase):
@@ -195,6 +196,74 @@ class MonitorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "another TCP state"):
             History(self.db_path, 7, "all", [], self.now)
         self.assertEqual(history.rows, [self.row()])
+
+    def test_sqlite_backup_includes_committed_wal_and_is_portable(self):
+        history = History(self.db_path, 7, "established", [], self.now)
+        snapshot = self.db_path.with_name("snapshot.sqlite3")
+        with history.connect() as held:
+            held.execute("PRAGMA wal_autocheckpoint=0")
+            held.execute("SELECT count(*) FROM samples").fetchone()
+            history.save(self.now, self.row())
+            self.assertGreater(Path(str(self.db_path) + "-wal").stat().st_size, 0)
+            history.backup(snapshot)
+        self.assertEqual(read_database_snapshot(snapshot), [self.row()])
+        with closing(sqlite3.connect(str(snapshot))) as db:
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        self.assertFalse(Path(str(snapshot) + "-wal").exists())
+
+    def test_database_import_rejects_unrelated_or_broken_files(self):
+        path = self.db_path.with_name("import.db")
+        path.write_bytes(b"not a SQLite file")
+        with self.assertRaises(ValueError):
+            read_database_snapshot(path)
+        path.unlink()
+        with closing(sqlite3.connect(str(path))) as db, db:
+            db.execute("CREATE TABLE unrelated (id INTEGER)")
+        with self.assertRaises(ValueError):
+            read_database_snapshot(path)
+        with closing(sqlite3.connect(str(path))) as db, db:
+            db.execute("CREATE VIEW samples AS SELECT 1 AS id, 1 AS timestamp, '{}' AS record")
+        with self.assertRaises(ValueError):
+            read_database_snapshot(path)
+
+    def test_http_database_export_and_import_leave_live_history_unchanged(self):
+        history = History(self.db_path, 7, "established", [], self.now)
+        history.save(self.now, self.row())
+        server = make_server("127.0.0.1", 0, history, Path(__file__).with_name("index.html"))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            address = "http://127.0.0.1:%d" % server.server_port
+            with urlopen(address + "/api/export", timeout=5) as response:
+                self.assertEqual(response.headers["Content-Type"], "application/vnd.sqlite3")
+                self.assertIn(DB_NAME, response.headers["Content-Disposition"])
+                snapshot = response.read()
+                self.assertEqual(int(response.headers["Content-Length"]), len(snapshot))
+                self.assertTrue(snapshot.startswith(b"SQLite format 3\x00"))
+            with urlopen(Request(address + "/api/export", method="HEAD"), timeout=5) as response:
+                self.assertEqual(response.read(), b"")
+                self.assertGreater(int(response.headers["Content-Length"]), 0)
+            # The historical snapshot predates the latest live sample.
+            history.save(self.now + 60, dict(self.row(), timestamp=self.now + 60, count=5))
+            with urlopen(Request(address + "/api/import", data=snapshot,
+                                 headers={"Content-Type": "application/vnd.sqlite3"}), timeout=5) as response:
+                self.assertEqual(json.loads(response.read())["records"], [self.row()])
+            self.assertEqual(len(history.rows), 2)
+            self.assertEqual(history.rows[-1]["count"], 5)
+            for body in (b"broken", b"", b"SQLite format 3\x00garbage"):
+                with self.subTest(body=body), self.assertRaises(HTTPError) as error:
+                    urlopen(Request(address + "/api/import", data=body), timeout=5)
+                self.assertEqual(error.exception.code, 400)
+                self.assertIn("error", json.loads(error.exception.read()))
+            with self.assertRaises(HTTPError) as oversized:
+                urlopen(Request(address + "/api/import", data=b"x",
+                                headers={"Content-Length": str(MAX_IMPORT_BYTES + 1)}), timeout=5)
+            self.assertEqual(oversized.exception.code, 413)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_ss_failure_is_missing_not_zero(self):
         cases = [(subprocess.TimeoutExpired("ss", 20), "ss_timeout"),

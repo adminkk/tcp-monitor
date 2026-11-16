@@ -32,9 +32,9 @@
       <label class="small">端口 <select id="port"><option value="all">全部端口合计</option></select></label>
       <label class="small">时间范围 <select id="range"><option value="1">最近 1 小时</option><option value="6">最近 6 小时</option><option value="24" selected>最近 24 小时</option><option value="168">最近 7 天</option><option value="0">全部保留数据</option><option value="custom" disabled>自定义时间</option></select></label>
       <span class="grow"></span><label class="small"><input type="checkbox" id="auto" checked> 每 60 秒刷新</label>
-      <button id="refresh">刷新</button><button id="online">读取服务器数据</button>
-      <a class="file" href="./tcp_connections.txt" download style="text-decoration:none">导出文本</a>
-      <label class="file">导入文本<input id="file" type="file" accept=".txt,.jsonl,text/plain"></label>
+      <button id="refresh">刷新</button><button id="online" hidden>返回实时监控</button>
+      <a class="file" href="./api/export" download="tcp_connections.sqlite3" style="text-decoration:none" title="导出服务器全部保留数据的 SQLite 快照">导出快照</a>
+      <label class="file" title="选择 SQLite 历史快照，由监控服务解析后查看；兼容旧文本，不覆盖服务器数据">打开历史快照<input id="file" type="file" accept=".sqlite3,.sqlite,.db,.txt,.jsonl,application/vnd.sqlite3,text/plain"></label>
     </div>
     <div class="toolbar"><label class="small">开始 <input id="start" type="datetime-local" step="1"></label><label class="small">结束 <input id="end" type="datetime-local" step="1"></label><button id="apply">应用时间范围</button><button id="zoom-reset" hidden>恢复框选前范围</button><span class="small">使用浏览器本地时区</span></div>
     <div class="small" id="scope">来源：服务器数据库</div>
@@ -92,9 +92,22 @@ async function load(nextSource = source, nextFile = importedFile, enableAuto = f
     let parsed, snapshot = null, bounds = null;
     if (nextSource === 'file') {
       if (!nextFile) return false;
-      parsed = parseData(await nextFile.text());
+      if (/\.(sqlite3?|db)$/i.test(nextFile.name)) {
+        if (location.protocol === 'file:') throw new Error('请通过监控服务网页打开 SQLite 历史快照；本地直接打开 HTML 时仍可查看旧文本。');
+        if (nextFile.size > 256 * 1024 * 1024) throw new Error('数据库文件不能超过 256 MB。');
+        const response = await fetch('./api/import', { method: 'POST',
+          headers: { 'Content-Type': 'application/vnd.sqlite3' }, body: nextFile,
+          signal: AbortSignal.timeout(60000) });
+        const result = JSON.parse(await response.text());
+        if (!response.ok) throw new Error(result.error || '数据库导入失败：HTTP ' + response.status);
+        if (!Array.isArray(result.records)) throw new Error('数据库采样格式无效。');
+        parsed = parseData(result.records.map(r => JSON.stringify(r)).join('\n'));
+        if (parsed.invalid) throw new Error('数据库包含无效的采样记录，请重新导出快照。');
+      } else {
+        parsed = parseData(await nextFile.text());
+      }
     } else {
-      if (location.protocol === 'file:') throw new Error('本地打开页面时，请点击“导入文本”选择下载的 tcp_connections.txt。');
+      if (location.protocol === 'file:') throw new Error('实时监控及 SQLite 快照查看需要通过监控服务网页访问；本地直接打开时可查看旧文本。');
       const mode = $('range').value, end = Date.now() / 1000;
       bounds = mode === 'custom' ? customBounds : Number(mode) ? [end - Number(mode) * 3600, end] : null;
       const query = bounds ? `?start=${bounds[0]}&end=${bounds[1]}` : '';
@@ -107,6 +120,7 @@ async function load(nextSource = source, nextFile = importedFile, enableAuto = f
     if (version !== requestVersion) return;
     if (nextSource !== source || (nextSource === 'file' && nextFile !== importedFile)) clearZoomOrigin();
     source = nextSource; importedFile = nextFile; readError = false;
+    $('online').hidden = source !== 'file' || location.protocol === 'file:';
     serverLatest = snapshot?.latest ?? null;
     serverPorts = snapshot?.ports ?? [];
     serverBounds = bounds;
@@ -117,7 +131,7 @@ async function load(nextSource = source, nextFile = importedFile, enableAuto = f
     updatePorts();
     render();
     const last = source === 'server' ? serverLatest : records[records.length - 1];
-    $('message').textContent = (source === 'file' ? '离线文件：更新后请重新导入。' : '服务器数据：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。')) +
+    $('message').textContent = (source === 'file' ? '历史快照：仅查看历史，不覆盖服务器数据；更新后请重新打开。' : '服务器数据：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。')) +
       (parsed.invalid ? ` 已跳过 ${parsed.invalid} 行无效数据。` : '') +
       (last ? ' 最新采样：' + fmt(last.timestamp) : ' 暂无采样数据。');
     return true;
@@ -189,7 +203,7 @@ function render() {
   $('minimum').textContent = valid.length ? number(valid.reduce((n, r) => Math.min(n, r.count), Infinity)) : '—';
   $('average').textContent = valid.length ? (valid.reduce((n, r) => n + r.count, 0) / valid.length).toFixed(1) : '—';
   $('samples').textContent = `${visible.length - valid.length} / ${visible.length}`;
-  $('badge').textContent = readError ? '读取失败' : !last ? '等待数据' : source === 'file' ? '离线数据' : Date.now() / 1000 - last.timestamp > 150 ? '采集已超时' : last.count === null ? '采集失败' : '正在采集';
+  $('badge').textContent = readError ? '读取失败' : !last ? '等待数据' : source === 'file' ? '历史快照' : Date.now() / 1000 - last.timestamp > 150 ? '采集已超时' : last.count === null ? '采集失败' : '正在采集';
   $('scope').textContent = last ? `来源：${source === 'file' ? importedFile.name : '服务器数据库'} · 状态：${last.state.toUpperCase()} · 当前统计：${selected === 'all' ? '全部端口合计' : '本机端口 ' + selected} · 最新采集范围：${scopeLabel(last)}` : '来源：暂无采样数据';
   $('legacy').textContent = selected !== 'all' && visible.some(r => r.error === '旧版合计记录没有端口明细') ?
     '当前区间包含旧版多端口合计记录，无法拆分的历史点显示为缺测；升级后新采集的数据可按端口查看。' : '';

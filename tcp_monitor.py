@@ -3,7 +3,7 @@
 
 import argparse
 from collections import deque
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -21,6 +22,8 @@ from urllib.parse import parse_qs, urlsplit
 INTERVAL = 60
 DATA_NAME = "tcp_connections.txt"
 DB_NAME = "tcp_connections.sqlite3"
+MAX_IMPORT_BYTES = 256 * 1024 * 1024
+MAX_IMPORT_ROWS = 1000000
 STATES = ("established", "all", "time-wait", "close-wait", "syn-recv", "syn-sent")
 
 
@@ -220,6 +223,40 @@ class History:
     def rows(self):
         return self.query()["records"]
 
+    def backup(self, destination):
+        # SQLite's backup API includes committed WAL data in one portable file.
+        with self.connect() as source, closing(sqlite3.connect(str(destination))) as target:
+            source.backup(target, pages=256)
+            target.execute("PRAGMA journal_mode=DELETE")
+
+
+def read_database_snapshot(path):
+    with Path(path).open("rb") as source:
+        if source.read(16) != b"SQLite format 3\x00":
+            raise ValueError("请选择有效的 SQLite 数据库文件。")
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+        db.execute("PRAGMA trusted_schema=OFF")
+        db.execute("PRAGMA query_only=ON")
+        deadline = time.monotonic() + 15
+        db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+        table = db.execute("SELECT rootpage FROM sqlite_master WHERE name='samples' AND type='table'").fetchone()
+        if not table or table[0] <= 0:
+            raise ValueError("数据库缺少 TCP 监控采样表，请选择本工具导出的快照。")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(samples)")}
+        if not {"id", "timestamp", "record"} <= columns:
+            raise ValueError("数据库采样表格式不兼容。")
+        if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise ValueError("数据库已损坏，请重新导出快照。")
+        # Imported databases are data only: disallow functions and schema changes.
+        db.set_authorizer(lambda action, *_: sqlite3.SQLITE_OK if action in
+                          (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ) else sqlite3.SQLITE_DENY)
+        records = []
+        for record, in db.execute("SELECT record FROM samples ORDER BY timestamp, id LIMIT ?", (MAX_IMPORT_ROWS + 1,)):
+            if len(records) >= MAX_IMPORT_ROWS:
+                raise ValueError("数据库样本超过 100 万条，请先导出较小的快照。")
+            records.append(json.loads(record))
+        return records
+
 
 def make_server(bind, port, history, html_path):
     class Handler(BaseHTTPRequestHandler):
@@ -229,9 +266,74 @@ def make_server(bind, port, history, html_path):
         def do_HEAD(self):
             self.send_file(True)
 
+        def send_json(self, value, status=200, head=False):
+            payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if not head:
+                try:
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def do_POST(self):
+            if urlsplit(self.path).path != "/api/import":
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0:
+                    raise ValueError("请选择非空的 SQLite 数据库文件。")
+                if length > MAX_IMPORT_BYTES:
+                    self.send_json({"error": "数据库文件不能超过 256 MB。"}, 413)
+                    return
+                self.connection.settimeout(30)
+                with tempfile.TemporaryDirectory(prefix="tcp-monitor-import-") as directory:
+                    path = Path(directory) / DB_NAME
+                    with path.open("wb") as target:
+                        remaining = length
+                        while remaining:
+                            chunk = self.rfile.read(min(65536, remaining))
+                            if not chunk:
+                                raise ValueError("文件上传不完整，请重试。")
+                            target.write(chunk)
+                            remaining -= len(chunk)
+                    records = read_database_snapshot(path)
+                self.send_json({"records": records})
+            except (ValueError, TypeError) as error:
+                self.send_json({"error": str(error)}, 400)
+            except sqlite3.Error:
+                self.send_json({"error": "数据库格式不兼容、已损坏或读取超时，请选择本工具导出的快照。"}, 400)
+            except OSError:
+                self.send_json({"error": "文件上传或临时存储失败，请重试。"}, 503)
+
         def send_file(self, head):
             url = urlsplit(self.path)
             route = url.path
+            if route == "/api/export":
+                try:
+                    with tempfile.TemporaryDirectory(prefix="tcp-monitor-export-") as directory:
+                        path = Path(directory) / DB_NAME
+                        history.backup(path)
+                        with path.open("rb") as snapshot:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/vnd.sqlite3")
+                            self.send_header("Content-Disposition", 'attachment; filename="' + DB_NAME + '"')
+                            self.send_header("Content-Length", str(os.fstat(snapshot.fileno()).st_size))
+                            self.send_header("Cache-Control", "no-store")
+                            self.send_header("X-Content-Type-Options", "nosniff")
+                            self.end_headers()
+                            if not head:
+                                shutil.copyfileobj(snapshot, self.wfile)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                except (sqlite3.Error, OSError):
+                    self.send_json({"error": "数据库快照导出失败，请重试。"}, 503, head)
+                return
             if route == "/api/history":
                 try:
                     params = parse_qs(url.query, keep_blank_values=True, max_num_fields=10)
