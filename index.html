@@ -13,6 +13,7 @@
     .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin:26px 0}.card,.panel{background:#111e31;border:1px solid #26364f;border-radius:14px;padding:20px}.label{color:#9eb0cb;font-size:13px}.value{font-size:32px;font-weight:650;margin-top:8px;font-variant-numeric:tabular-nums}
     .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:18px}button,select,.file,input[type=datetime-local]{font:inherit;background:#1b2c44;color:#deebff;border:1px solid #364b68;border-radius:8px;padding:9px 12px;font-size:13px;cursor:pointer}button:hover,.file:hover{border-color:#60d9c0}input[type=file]{display:none}input[type=checkbox]{accent-color:#60d9c0}.grow{flex:1}.small{font-size:13px;color:#93a8c7}.chart{position:relative;height:350px}canvas{width:100%;height:100%;display:block}.tooltip{display:none;position:absolute;pointer-events:none;background:#07101f;border:1px solid #54708c;padding:9px;border-radius:7px;font-size:12px;white-space:pre-line}
     #message{min-height:24px;color:#a3b8d5;font-size:13px;line-height:1.6;margin:16px 0}.table-wrap{overflow:auto;max-height:340px}table{width:100%;border-collapse:collapse;font-size:13px;text-align:left}th,td{padding:12px;border-bottom:1px solid #26364f}th{color:#9eb0cb;position:sticky;top:0;background:#111e31}.section-title{font-size:16px;margin:0 0 14px}footer{margin-top:20px;color:#8499b6;font-size:12px;line-height:1.8}
+    #chart{cursor:crosshair;touch-action:pan-y;user-select:none}.brush{display:none;position:absolute;pointer-events:none;background:#60d9c026;border:1px solid #60d9c0}#chart-help{margin-top:8px}
     @media(max-width:650px){main{padding:20px 12px}.stats{grid-template-columns:repeat(2,1fr);gap:10px}.card,.panel{padding:14px}.chart{height:290px}.value{font-size:27px}}
   </style>
 </head>
@@ -31,12 +32,14 @@
       <label class="small">端口 <select id="port"><option value="all">全部端口合计</option></select></label>
       <label class="small">时间范围 <select id="range"><option value="1">最近 1 小时</option><option value="6">最近 6 小时</option><option value="24" selected>最近 24 小时</option><option value="168">最近 7 天</option><option value="0">全部保留数据</option><option value="custom" disabled>自定义时间</option></select></label>
       <span class="grow"></span><label class="small"><input type="checkbox" id="auto" checked> 每 60 秒刷新</label>
-      <button id="refresh">刷新</button><button id="online">读取服务器文本</button>
+      <button id="refresh">刷新</button><button id="online">读取服务器数据</button>
+      <a class="file" href="./tcp_connections.txt" download style="text-decoration:none">导出文本</a>
       <label class="file">导入文本<input id="file" type="file" accept=".txt,.jsonl,text/plain"></label>
     </div>
-    <div class="toolbar"><label class="small">开始 <input id="start" type="datetime-local" step="1"></label><label class="small">结束 <input id="end" type="datetime-local" step="1"></label><button id="apply">应用时间范围</button><span class="small">使用浏览器本地时区</span></div>
-    <div class="small" id="scope">来源：tcp_connections.txt</div>
-    <div class="chart"><canvas id="chart" aria-label="TCP 连接数随时间变化的折线图" role="img"></canvas><div class="tooltip" id="tooltip"></div></div>
+    <div class="toolbar"><label class="small">开始 <input id="start" type="datetime-local" step="1"></label><label class="small">结束 <input id="end" type="datetime-local" step="1"></label><button id="apply">应用时间范围</button><button id="zoom-reset" hidden>恢复框选前范围</button><span class="small">使用浏览器本地时区</span></div>
+    <div class="small" id="scope">来源：服务器数据库</div>
+    <div class="chart"><canvas id="chart" aria-label="TCP 连接数随时间变化的折线图" aria-describedby="chart-help" role="img"></canvas><div class="brush" id="brush" aria-hidden="true"></div><div class="tooltip" id="tooltip"></div></div>
+    <div class="small" id="chart-help">在图中横向拖拽框选时间范围，松开应用；按 Esc 取消。</div>
     <div id="message" role="status"></div>
     <div id="legacy" class="small" role="status"></div>
     <div id="scope-change" class="small" role="status"></div>
@@ -50,6 +53,9 @@ const $ = id => document.getElementById(id);
 let records = [], visible = [], source = 'server', importedFile = null, requestVersion = 0;
 let chartPoints = [], domain = null, customBounds = null, rangeBounds = null;
 let readError = false;
+let serverLatest = null, serverPorts = [], serverBounds = null;
+let selection = null, zoomOrigin = null;
+const selectionHint = '在图中横向拖拽框选时间范围，松开应用；按 Esc 取消。';
 const fmt = t => new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
 const number = n => n == null ? '—' : n.toLocaleString('zh-CN');
 
@@ -83,28 +89,37 @@ function parseData(text) {
 async function load(nextSource = source, nextFile = importedFile, enableAuto = false) {
   const version = ++requestVersion;
   try {
-    let text;
+    let parsed, snapshot = null, bounds = null;
     if (nextSource === 'file') {
       if (!nextFile) return false;
-      text = await nextFile.text();
+      parsed = parseData(await nextFile.text());
     } else {
       if (location.protocol === 'file:') throw new Error('本地打开页面时，请点击“导入文本”选择下载的 tcp_connections.txt。');
-      const response = await fetch('./tcp_connections.txt', { cache: 'no-store', signal: AbortSignal.timeout(15000) });
-      if (!response.ok) throw new Error('读取文本失败：HTTP ' + response.status);
-      text = await response.text();
+      const mode = $('range').value, end = Date.now() / 1000;
+      bounds = mode === 'custom' ? customBounds : Number(mode) ? [end - Number(mode) * 3600, end] : null;
+      const query = bounds ? `?start=${bounds[0]}&end=${bounds[1]}` : '';
+      const response = await fetch('./api/history' + query, { cache: 'no-store', signal: AbortSignal.timeout(15000) });
+      if (!response.ok) throw new Error('读取数据失败：HTTP ' + response.status);
+      snapshot = JSON.parse(await response.text());
+      if (!Array.isArray(snapshot.records) || !Array.isArray(snapshot.ports)) throw new Error('服务器数据格式无效');
+      parsed = parseData(snapshot.records.map(r => JSON.stringify(r)).join('\n'));
     }
     if (version !== requestVersion) return;
-    const parsed = parseData(text);
+    if (nextSource !== source || (nextSource === 'file' && nextFile !== importedFile)) clearZoomOrigin();
     source = nextSource; importedFile = nextFile; readError = false;
+    serverLatest = snapshot?.latest ?? null;
+    serverPorts = snapshot?.ports ?? [];
+    serverBounds = bounds;
     $('auto').disabled = source === 'file';
     if (source === 'file') $('auto').checked = false;
     else if (enableAuto) $('auto').checked = true;
     records = parsed.records;
     updatePorts();
     render();
-    $('message').textContent = (source === 'file' ? '离线文件：更新后请重新导入。' : '服务器文本：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。')) +
+    const last = source === 'server' ? serverLatest : records[records.length - 1];
+    $('message').textContent = (source === 'file' ? '离线文件：更新后请重新导入。' : '服务器数据：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。')) +
       (parsed.invalid ? ` 已跳过 ${parsed.invalid} 行无效数据。` : '') +
-      (records.length ? ' 最新采样：' + fmt(records[records.length - 1].timestamp) : ' 暂无采样数据。');
+      (last ? ' 最新采样：' + fmt(last.timestamp) : ' 暂无采样数据。');
     return true;
   } catch (error) {
     if (version !== requestVersion) return;
@@ -117,7 +132,7 @@ async function load(nextSource = source, nextFile = importedFile, enableAuto = f
 
 function updatePorts() {
   const selected = $('port').value;
-  const ports = [...new Set(records.flatMap(r => r.ports))].sort((a, b) => a - b);
+  const ports = [...new Set([...serverPorts, ...records.flatMap(r => r.ports)])].sort((a, b) => a - b);
   $('port').replaceChildren(new Option('全部端口合计', 'all'));
   for (const port of ports) $('port').append(new Option(String(port), String(port)));
   $('port').value = selected === 'all' || ports.includes(Number(selected)) ? selected : 'all';
@@ -150,7 +165,7 @@ function statisticScope(row) {
 function render() {
   const mode = $('range').value;
   const end = source === 'file' && records.length ? records[records.length - 1].timestamp : Date.now() / 1000;
-  rangeBounds = mode === 'custom' ? customBounds : Number(mode) ? [end - Number(mode) * 3600, end] : null;
+  rangeBounds = source === 'server' ? serverBounds : mode === 'custom' ? customBounds : Number(mode) ? [end - Number(mode) * 3600, end] : null;
   const selected = $('port').value;
   visible = records.filter(r => !rangeBounds || (r.timestamp >= rangeBounds[0] && r.timestamp <= rangeBounds[1]))
     .map(r => portSample(r, selected));
@@ -168,14 +183,14 @@ function render() {
     $('end').value = localInput(rangeBounds ? rangeBounds[1] : end);
   }
   const valid = visible.filter(r => r.count !== null);
-  const last = records[records.length - 1];
+  const last = source === 'server' ? serverLatest ?? records[records.length - 1] : records[records.length - 1];
   $('current').textContent = number(visible[visible.length - 1]?.count);
   $('peak').textContent = valid.length ? number(valid.reduce((n, r) => Math.max(n, r.count), 0)) : '—';
   $('minimum').textContent = valid.length ? number(valid.reduce((n, r) => Math.min(n, r.count), Infinity)) : '—';
   $('average').textContent = valid.length ? (valid.reduce((n, r) => n + r.count, 0) / valid.length).toFixed(1) : '—';
   $('samples').textContent = `${visible.length - valid.length} / ${visible.length}`;
   $('badge').textContent = readError ? '读取失败' : !last ? '等待数据' : source === 'file' ? '离线数据' : Date.now() / 1000 - last.timestamp > 150 ? '采集已超时' : last.count === null ? '采集失败' : '正在采集';
-  $('scope').textContent = last ? `来源：${source === 'file' ? importedFile.name : '服务器文本'} · 状态：${last.state.toUpperCase()} · 当前统计：${selected === 'all' ? '全部端口合计' : '本机端口 ' + selected} · 最新采集范围：${scopeLabel(last)}` : '来源：tcp_connections.txt';
+  $('scope').textContent = last ? `来源：${source === 'file' ? importedFile.name : '服务器数据库'} · 状态：${last.state.toUpperCase()} · 当前统计：${selected === 'all' ? '全部端口合计' : '本机端口 ' + selected} · 最新采集范围：${scopeLabel(last)}` : '来源：暂无采样数据';
   $('legacy').textContent = selected !== 'all' && visible.some(r => r.error === '旧版合计记录没有端口明细') ?
     '当前区间包含旧版多端口合计记录，无法拆分的历史点显示为缺测；升级后新采集的数据可按端口查看。' : '';
   $('rows').replaceChildren();
@@ -194,6 +209,7 @@ function render() {
 }
 
 function draw() {
+  cancelSelection();
   $('tooltip').style.display = 'none';
   const canvas = $('chart'), width = canvas.clientWidth, height = canvas.clientHeight;
   const ratio = window.devicePixelRatio || 1;
@@ -250,11 +266,11 @@ function draw() {
   }
   ctx.stroke(); ctx.fillStyle = '#60d9c0';
   for (const r of chartPoints) { ctx.beginPath(); ctx.arc(x(r.timestamp), y(r.count), 1.8, 0, Math.PI * 2); ctx.fill(); }
-  domain = { left, right, start, end };
+  domain = { left, right, top, bottom, start, end };
 }
 
 $('chart').addEventListener('mousemove', event => {
-  if (!domain || !visible.length) return;
+  if (selection || !domain || !visible.length) return;
   const rect = $('chart').getBoundingClientRect(), xx = event.clientX - rect.left;
   const time = domain.start + (xx - domain.left) / (domain.right - domain.left) * (domain.end - domain.start);
   let lo = 0, hi = visible.length - 1;
@@ -272,21 +288,88 @@ function localInput(timestamp) {
   const pad = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
-$('range').addEventListener('change', render);
+function reloadRange() { if (source === 'server') return load(); render(); }
+function clearZoomOrigin() { zoomOrigin = null; $('zoom-reset').hidden = true; }
+function chartPosition(event) {
+  const rect = $('chart').getBoundingClientRect();
+  return { x: (event.clientX - rect.left) * $('chart').clientWidth / rect.width,
+    y: (event.clientY - rect.top) * $('chart').clientHeight / rect.height };
+}
+function cancelSelection() {
+  const previous = selection;
+  selection = null;
+  $('brush').style.display = 'none';
+  $('chart-help').textContent = selectionHint;
+  if (previous && $('chart').hasPointerCapture(previous.pointerId)) $('chart').releasePointerCapture(previous.pointerId);
+}
+function selectionTimes() {
+  const { startX, endX, axis } = selection;
+  const time = x => axis.start + (x - axis.left) / (axis.right - axis.left) * (axis.end - axis.start);
+  return [Math.floor(time(Math.min(startX, endX))), Math.ceil(time(Math.max(startX, endX)))];
+}
+function moveSelection(event) {
+  const { axis } = selection;
+  selection.endX = Math.max(axis.left, Math.min(axis.right, chartPosition(event).x));
+  const brush = $('brush');
+  brush.style.display = 'block';
+  brush.style.left = Math.min(selection.startX, selection.endX) + 'px';
+  brush.style.width = Math.abs(selection.endX - selection.startX) + 'px';
+  brush.style.top = axis.top + 'px'; brush.style.height = axis.bottom - axis.top + 'px';
+  const [start, end] = selectionTimes();
+  $('chart-help').textContent = `框选：${fmt(start)} — ${fmt(end)}；松开应用，Esc 取消。`;
+}
+$('chart').addEventListener('pointerdown', event => {
+  if (selection || !domain || event.button !== 0 || event.isPrimary === false) return;
+  const { x, y } = chartPosition(event);
+  if (x < domain.left || x > domain.right || y < domain.top || y > domain.bottom) return;
+  selection = { pointerId: event.pointerId, startX: x, endX: x, axis: { ...domain } };
+  $('tooltip').style.display = 'none';
+  $('chart').setPointerCapture(event.pointerId);
+});
+$('chart').addEventListener('pointermove', event => {
+  if (selection && event.pointerId === selection.pointerId) moveSelection(event);
+});
+$('chart').addEventListener('pointerup', event => {
+  if (!selection || event.pointerId !== selection.pointerId) return;
+  moveSelection(event);
+  const distance = Math.abs(selection.startX - selection.endX), bounds = selectionTimes();
+  cancelSelection();
+  if (distance < 6 || bounds[1] <= bounds[0]) return;
+  if (!zoomOrigin) zoomOrigin = { mode: $('range').value, bounds: customBounds?.slice() ?? null };
+  $('zoom-reset').hidden = false;
+  customBounds = bounds; $('range').value = 'custom';
+  $('start').value = localInput(bounds[0]); $('end').value = localInput(bounds[1]);
+  return reloadRange();
+});
+for (const name of ['pointercancel', 'lostpointercapture']) $('chart').addEventListener(name, event => {
+  if (selection && event.pointerId === selection.pointerId) cancelSelection();
+});
+document.addEventListener('keydown', event => { if (event.key === 'Escape') cancelSelection(); });
+$('zoom-reset').addEventListener('click', () => {
+  if (!zoomOrigin) return;
+  $('range').value = zoomOrigin.mode; customBounds = zoomOrigin.bounds;
+  if (customBounds) {
+    $('start').value = localInput(customBounds[0]); $('end').value = localInput(customBounds[1]);
+  }
+  clearZoomOrigin();
+  return reloadRange();
+});
+$('range').addEventListener('change', () => { cancelSelection(); clearZoomOrigin(); return reloadRange(); });
 $('port').addEventListener('change', () => { $('tooltip').style.display = 'none'; render(); });
 $('apply').addEventListener('click', () => {
   const start = new Date($('start').value).getTime() / 1000, end = new Date($('end').value).getTime() / 1000;
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
     $('message').textContent = '请输入有效的开始、结束时间，结束时间必须晚于开始时间。'; return;
   }
-  customBounds = [start, end]; $('range').value = 'custom'; render();
-  $('message').textContent = `查看区间：${fmt(start)} — ${fmt(end)}。仅展示文本中仍保留的数据。`;
+  cancelSelection(); clearZoomOrigin();
+  customBounds = [start, end]; $('range').value = 'custom'; reloadRange();
+  if (source === 'file') $('message').textContent = `查看区间：${fmt(start)} — ${fmt(end)}。仅展示文件中仍保留的数据。`;
 });
 $('refresh').addEventListener('click', () => load());
 $('online').addEventListener('click', () => load('server', importedFile, true));
 $('auto').addEventListener('change', () => {
   if (!readError && source === 'server') $('message').textContent = $('message').textContent.replace(
-    /^服务器文本：[^。]*。/, '服务器文本：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。'));
+    /^服务器数据：[^。]*。/, '服务器数据：' + ($('auto').checked ? '每 60 秒自动刷新。' : '自动刷新已暂停。'));
 });
 $('file').addEventListener('change', event => {
   const file = event.target.files[0]; if (!file) return;
@@ -294,7 +377,7 @@ $('file').addEventListener('change', event => {
   event.target.value = '';
 });
 new ResizeObserver(draw).observe($('chart'));
-setInterval(() => { if ($('auto').checked && source === 'server') load(); }, 60000);
+setInterval(() => { if (!selection && $('auto').checked && source === 'server') load(); }, 60000);
 load();
 </script>
 </body>

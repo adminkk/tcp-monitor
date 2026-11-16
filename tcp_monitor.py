@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Sample Linux TCP sockets every 60 seconds; retain a bounded JSON-lines file."""
+"""Sample Linux TCP sockets every 60 seconds; retain history in SQLite."""
 
 import argparse
 from collections import deque
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -10,14 +11,16 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 INTERVAL = 60
 DATA_NAME = "tcp_connections.txt"
+DB_NAME = "tcp_connections.sqlite3"
 STATES = ("established", "all", "time-wait", "close-wait", "syn-recv", "syn-sent")
 
 
@@ -71,7 +74,7 @@ def sample(ss_path, state, ports, now=None):
     return record
 
 
-class History:
+class _LegacyHistory:
     def __init__(self, path, days, state, ports, now=None):
         self.path = Path(path)
         self.days, self.state, self.ports = days, state, list(ports)
@@ -122,27 +125,103 @@ class History:
         if skipped:
             print("Ignored %d malformed history lines." % skipped, file=sys.stderr)
 
-    def save(self, now, row=None):
-        # A clock correction must not retain records outside the configured window.
-        self.rows = deque((r for r in self.rows
-                           if now - self.days * 86400 <= r["timestamp"] <= now),
-                          maxlen=self.limit)
-        if row is not None:
-            self.rows.append(row)
-        temporary = self.path.with_name(".tcp_connections.tmp")
+class History:
+    def __init__(self, path, days, state, ports, now=None):
+        self.path = Path(path)
+        self.days, self.state, self.ports = days, state, list(ports)
+        self.limit = days * 1440 + 1
+        current = time.time() if now is None else now
+        with self.connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS samples (
+                    id INTEGER PRIMARY KEY, timestamp REAL NOT NULL, record TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS samples_time ON samples(timestamp, id);
+                CREATE TABLE IF NOT EXISTS sample_ports (
+                    sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+                    port INTEGER NOT NULL, PRIMARY KEY(sample_id, port));
+                CREATE INDEX IF NOT EXISTS ports_lookup ON sample_ports(port, sample_id);
+            """)
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                stored_state = db.execute("SELECT value FROM metadata WHERE key='state'").fetchone()
+                if stored_state and stored_state[0] != state and db.execute(
+                        "SELECT 1 FROM samples WHERE timestamp BETWEEN ? AND ? LIMIT 1",
+                        (current - days * 86400, current)).fetchone():
+                    raise RuntimeError("Existing data uses another TCP state; "
+                                       "choose a different --output-dir.")
+                if not db.execute("SELECT 1 FROM metadata WHERE key='legacy_imported'").fetchone():
+                    legacy = _LegacyHistory(self.path.with_name(DATA_NAME), days, state, ports, current)
+                    for row in legacy.rows:
+                        self._insert(db, row)
+                    db.execute("INSERT INTO metadata VALUES ('legacy_imported', '1')")
+                db.execute("INSERT OR REPLACE INTO metadata VALUES ('state', ?)", (state,))
+                self._prune(db, current)
+                self._count = self._cap(db, db.execute("SELECT count(*) FROM samples").fetchone()[0])
+
+    @contextmanager
+    def connect(self):
+        db = sqlite3.connect(str(self.path), timeout=15)
         try:
-            with temporary.open(mode="w", encoding="utf-8", newline="\n") as target:
-                for item in self.rows:
-                    target.write(json.dumps(item, separators=(",", ":")) + "\n")
-                target.flush()
-                os.fsync(target.fileno())
-            os.replace(temporary, self.path)
+            db.execute("PRAGMA foreign_keys=ON")
+            yield db
         finally:
-            if temporary.exists():
-                temporary.unlink()
+            db.close()
+
+    @staticmethod
+    def _insert(db, row):
+        sample_id = db.execute("INSERT INTO samples(timestamp, record) VALUES (?, ?)",
+                               (row["timestamp"], json.dumps(row, separators=(",", ":")))).lastrowid
+        db.executemany("INSERT INTO sample_ports VALUES (?, ?)",
+                       ((sample_id, port) for port in row["ports"]))
+
+    def _prune(self, db, now):
+        deleted = db.execute("DELETE FROM samples WHERE timestamp < ?",
+                             (now - self.days * 86400,)).rowcount
+        deleted += db.execute("DELETE FROM samples WHERE timestamp > ?", (now,)).rowcount
+        return deleted
+
+    def save(self, now, row=None):
+        with self.connect() as db, db:
+            count = self._count - self._prune(db, now)
+            if row is not None:
+                self._insert(db, row)
+                count += 1
+            count = self._cap(db, count)
+        self._count = count
+
+    def _cap(self, db, count):
+        if count > self.limit:
+            db.execute("DELETE FROM samples WHERE id IN "
+                       "(SELECT id FROM samples ORDER BY timestamp, id LIMIT ?)",
+                       (count - self.limit,))
+        return min(count, self.limit)
+
+    def query(self, start=None, end=None):
+        with self.connect() as db, db:
+            # All fields describe the same committed snapshot, even during a sample.
+            db.execute("BEGIN")
+            latest = db.execute("SELECT record FROM samples ORDER BY timestamp DESC, id DESC LIMIT 1").fetchone()
+            first = db.execute("SELECT timestamp FROM samples ORDER BY timestamp, id LIMIT 1").fetchone()
+            clauses, params = [], []
+            for name, value, operator in (("timestamp", start, ">="), ("timestamp", end, "<=")):
+                if value is not None:
+                    clauses.append(name + operator + "?")
+                    params.append(value)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            records = [json.loads(r[0]) for r in db.execute(
+                "SELECT record FROM samples" + where + " ORDER BY timestamp, id", params)]
+            return {"records": records, "latest": json.loads(latest[0]) if latest else None,
+                    "first": first[0] if first else None,
+                    "ports": [r[0] for r in db.execute("SELECT DISTINCT port FROM sample_ports ORDER BY port")]}
+
+    @property
+    def rows(self):
+        return self.query()["records"]
 
 
-def make_server(bind, port, data_path, html_path):
+def make_server(bind, port, history, html_path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_file(False)
@@ -151,11 +230,57 @@ def make_server(bind, port, data_path, html_path):
             self.send_file(True)
 
         def send_file(self, head):
-            route = urlsplit(self.path).path
+            url = urlsplit(self.path)
+            route = url.path
+            if route == "/api/history":
+                try:
+                    params = parse_qs(url.query, keep_blank_values=True, max_num_fields=10)
+                    if set(params) - {"start", "end"} or any(len(v) != 1 for v in params.values()):
+                        raise ValueError("invalid parameters")
+                    bounds = {key: float(value[0]) for key, value in params.items()}
+                    if any(not math.isfinite(v) for v in bounds.values()):
+                        raise ValueError("non-finite timestamp")
+                    if bounds.get("start", -math.inf) > bounds.get("end", math.inf):
+                        raise ValueError("invalid time range")
+                    payload = json.dumps(history.query(**bounds), separators=(",", ":")).encode("utf-8")
+                except ValueError:
+                    self.send_error(400, "Invalid time range")
+                    return
+                except sqlite3.Error:
+                    self.send_error(503, "History temporarily unavailable")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                if not head:
+                    try:
+                        self.wfile.write(payload)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                return
+            if route == "/" + DATA_NAME:
+                # Export a consistent snapshot without creating another history file.
+                try:
+                    with history.connect() as db, db:
+                        db.execute("BEGIN")
+                        cursor = db.execute("SELECT record FROM samples ORDER BY timestamp, id")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.send_header("Content-Disposition", 'attachment; filename="' + DATA_NAME + '"')
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Content-Type-Options", "nosniff")
+                        self.end_headers()
+                        if not head:
+                            for record, in cursor:
+                                self.wfile.write((record + "\n").encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             if route in ("/", "/index.html"):
                 path, mime = html_path, "text/html; charset=utf-8"
-            elif route == "/" + DATA_NAME:
-                path, mime = data_path, "text/plain; charset=utf-8"
             else:
                 self.send_error(404)
                 return
@@ -216,13 +341,13 @@ def main(argv=None):
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stopped.set())
     try:
-        history = History(args.output_dir / DATA_NAME, args.days, args.state, sorted(set(args.port)))
+        history = History(args.output_dir / DB_NAME, args.days, args.state, sorted(set(args.port)))
         history.save(time.time())
         if args.http_port and not args.once:
-            server = make_server(args.bind, args.http_port, history.path, html_path)
+            server = make_server(args.bind, args.http_port, history, html_path)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             print("Dashboard: http://%s:%d/" % (args.bind, args.http_port), flush=True)
-        print("TCP state=%s local_ports=%s retention=%d days; file=%s" %
+        print("TCP state=%s local_ports=%s retention=%d days; database=%s" %
               (args.state, history.ports or "ALL", args.days, history.path.resolve()), flush=True)
         while not stopped.is_set():
             started = time.monotonic()
@@ -244,6 +369,6 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
         print("tcp-monitor: %s" % exc, file=sys.stderr)
         sys.exit(1)

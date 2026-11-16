@@ -129,7 +129,9 @@ preflight() {
   LOG_FILE="$(cd -- "$(dirname -- "$LOG_FILE")" && pwd -P)/$(basename -- "$LOG_FILE")"
   local protected
   for protected in "$SCRIPT_FILE" "$SCRIPT_DIR/index.html" "$SCRIPT_DIR/tcp-monitor.sh" \
-    "$OUTPUT_DIR/tcp_connections.txt" "$PID_FILE" "$OUTPUT_DIR/.tcp-monitor.lock" \
+    "$OUTPUT_DIR/tcp_connections.txt" "$OUTPUT_DIR/tcp_connections.sqlite3" \
+    "$OUTPUT_DIR/tcp_connections.sqlite3-wal" "$OUTPUT_DIR/tcp_connections.sqlite3-shm" \
+    "$OUTPUT_DIR/tcp_connections.sqlite3-journal" "$PID_FILE" "$OUTPUT_DIR/.tcp-monitor.lock" \
     "$OUTPUT_DIR/.tcp-launcher.lock" "$OUTPUT_DIR/.tcp_connections.tmp"; do
     if [[ $LOG_FILE == "$protected" || ( -e $LOG_FILE && $LOG_FILE -ef $protected ) ]]; then
       die "Log path conflicts with a program or data file: $protected"
@@ -171,7 +173,7 @@ start_monitor() {
       return 1
     fi
     if grep -q '^TCP state=' "$LOG_FILE" && read_running; then
-      printf 'Started: PID %s\nData: %s/tcp_connections.txt\nLog: %s\n' "$pid" "$OUTPUT_DIR" "$LOG_FILE"
+      printf 'Started: PID %s\nData: %s/tcp_connections.sqlite3\nLog: %s\n' "$pid" "$OUTPUT_DIR" "$LOG_FILE"
       if (( HTTP_PORT != 0 )); then printf 'HTTP: http://%s:%s/\n' "$BIND" "$HTTP_PORT"; else printf 'HTTP disabled\n'; fi
       return 0
     fi
@@ -207,7 +209,7 @@ case "$ACTION" in
   stop) stop_monitor ;;
   status)
     if read_running; then
-      printf 'Running: PID %s\nData: %s/tcp_connections.txt\n' "$RUNNING_PID" "$OUTPUT_DIR"
+      printf 'Running: PID %s\nData: %s/tcp_connections.sqlite3\n' "$RUNNING_PID" "$OUTPUT_DIR"
     else
       printf 'Not running\n'; exit 3
     fi ;;
